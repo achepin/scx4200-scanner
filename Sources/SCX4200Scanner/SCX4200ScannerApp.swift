@@ -28,7 +28,7 @@ enum OutputFormat: String, CaseIterable, Identifiable, Sendable {
 struct ScanReview: Identifiable, Sendable {
     let id = UUID()
     let originalURL: URL
-    let whiteBackgroundURL: URL
+    let whiteBackgroundURL: URL?
     let destinationURL: URL
     let outputFormat: OutputFormat
     let temporaryDirectory: URL
@@ -109,10 +109,13 @@ final class ScannerViewModel: ObservableObject {
                 if shouldSuggestWhiteBackground {
                     let whiteBackground = temporaryDirectory.appendingPathComponent("white-background.png")
                     try FileManager.default.copyItem(at: original, to: whiteBackground)
-                    try BackgroundWhitening.whitenOuterBackground(in: whiteBackground)
+                    let whiteBackgroundIsSafe = try BackgroundWhitening.whitenOuterBackground(in: whiteBackground)
+                    if !whiteBackgroundIsSafe {
+                        try? FileManager.default.removeItem(at: whiteBackground)
+                    }
                     let scanReview = ScanReview(
                         originalURL: original,
-                        whiteBackgroundURL: whiteBackground,
+                        whiteBackgroundURL: whiteBackgroundIsSafe ? whiteBackground : nil,
                         destinationURL: destination,
                         outputFormat: requestedFormat,
                         temporaryDirectory: temporaryDirectory
@@ -148,7 +151,7 @@ final class ScannerViewModel: ObservableObject {
 
         Task.detached {
             do {
-                let source = withWhiteBackground ? review.whiteBackgroundURL : review.originalURL
+                let source = withWhiteBackground ? (review.whiteBackgroundURL ?? review.originalURL) : review.originalURL
                 try Self.export(source, format: review.outputFormat, destination: review.destinationURL)
                 try? FileManager.default.removeItem(at: review.temporaryDirectory)
                 await MainActor.run {
@@ -374,15 +377,21 @@ private struct ScanReviewView: View {
 
             HStack(alignment: .top, spacing: 18) {
                 preview(title: "Как есть", url: review.originalURL)
-                preview(title: "Белый фон", url: review.whiteBackgroundURL)
+                if let whiteBackgroundURL = review.whiteBackgroundURL {
+                    preview(title: "Белый фон", url: whiteBackgroundURL)
+                } else {
+                    unavailableWhiteBackgroundPreview
+                }
             }
 
             HStack {
                 Button("Отменить", role: .cancel, action: cancel)
                 Spacer()
                 Button("Оставить как есть", action: keepOriginal)
-                Button("Сохранить с белым фоном", action: keepWhiteBackground)
-                    .keyboardShortcut(.defaultAction)
+                if review.whiteBackgroundURL != nil {
+                    Button("Сохранить с белым фоном", action: keepWhiteBackground)
+                        .keyboardShortcut(.defaultAction)
+                }
             }
         }
         .padding(24)
@@ -402,6 +411,19 @@ private struct ScanReviewView: View {
                     ContentUnavailableView("Не удалось открыть превью", systemImage: "exclamationmark.triangle")
                 }
             }
+            .frame(width: 390, height: 500)
+            .background(.quaternary, in: RoundedRectangle(cornerRadius: 10))
+        }
+    }
+
+    private var unavailableWhiteBackgroundPreview: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("Белый фон").font(.headline)
+            ContentUnavailableView(
+                "Недоступно безопасно",
+                systemImage: "checkmark.shield",
+                description: Text("Документ заполняет почти всё стекло или содержит бледный цветной рисунок. Оригинальные цвета сохранены.")
+            )
             .frame(width: 390, height: 500)
             .background(.quaternary, in: RoundedRectangle(cornerRadius: 10))
         }

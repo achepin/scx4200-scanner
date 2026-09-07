@@ -4,7 +4,8 @@ import ImageIO
 import UniformTypeIdentifiers
 
 enum BackgroundWhitening {
-    static func whitenOuterBackground(in imageURL: URL) throws {
+    /// Returns false rather than risking a color document when its boundaries are uncertain.
+    static func whitenOuterBackground(in imageURL: URL) throws -> Bool {
         guard let source = CGImageSourceCreateWithURL(imageURL as CFURL, nil),
               let image = CGImageSourceCreateImageAtIndex(source, 0, nil) else {
             throw BackgroundWhiteningError.cannotReadImage
@@ -31,23 +32,24 @@ enum BackgroundWhitening {
         }
         context.draw(image, in: CGRect(x: 0, y: 0, width: width, height: height))
 
-        if let edges = detectColoredRectangle(in: pixels, width: width, height: height) {
-            let safetyMargin = 5.0
-            for y in 0..<height {
-                let left = edges.left.value(at: Double(y)) - safetyMargin
-                let right = edges.right.value(at: Double(y)) + safetyMargin
-                for x in 0..<width {
-                    let top = edges.top.value(at: Double(x)) - safetyMargin
-                    let bottom = edges.bottom.value(at: Double(x)) + safetyMargin
-                    guard Double(x) < left || Double(x) > right || Double(y) < top || Double(y) > bottom else { continue }
-                    let offset = y * bytesPerRow + x * 4
-                    pixels[offset] = 255
-                    pixels[offset + 1] = 255
-                    pixels[offset + 2] = 255
-                }
+        guard let edges = detectColoredRectangle(in: pixels, width: width, height: height),
+              hasSafeMargins(edges, width: width, height: height) else {
+            return false
+        }
+
+        let safetyMargin = 5.0
+        for y in 0..<height {
+            let left = edges.left.value(at: Double(y)) - safetyMargin
+            let right = edges.right.value(at: Double(y)) + safetyMargin
+            for x in 0..<width {
+                let top = edges.top.value(at: Double(x)) - safetyMargin
+                let bottom = edges.bottom.value(at: Double(x)) + safetyMargin
+                guard Double(x) < left || Double(x) > right || Double(y) < top || Double(y) > bottom else { continue }
+                let offset = y * bytesPerRow + x * 4
+                pixels[offset] = 255
+                pixels[offset + 1] = 255
+                pixels[offset + 2] = 255
             }
-        } else {
-            whitenConnectedNeutralBackground(in: &pixels, width: width, height: height)
         }
 
         guard let provider = CGDataProvider(data: Data(pixels) as CFData),
@@ -77,6 +79,7 @@ enum BackgroundWhitening {
         CGImageDestinationAddImage(destination, correctedImage, nil)
         guard CGImageDestinationFinalize(destination) else { throw BackgroundWhiteningError.cannotWriteImage }
         _ = try FileManager.default.replaceItemAt(imageURL, withItemAt: temporaryURL)
+        return true
     }
 
     private static func detectColoredRectangle(in pixels: [UInt8], width: Int, height: Int) -> RectangleEdges? {
@@ -118,6 +121,28 @@ enum BackgroundWhitening {
         return RectangleEdges(left: left, right: right, top: top, bottom: bottom)
     }
 
+    private static func hasSafeMargins(_ edges: RectangleEdges, width: Int, height: Int) -> Bool {
+        let centerX = Double(width) / 2
+        let centerY = Double(height) / 2
+        let left = edges.left.value(at: centerY)
+        let right = edges.right.value(at: centerY)
+        let top = edges.top.value(at: centerX)
+        let bottom = edges.bottom.value(at: centerX)
+        let objectWidth = right - left
+        let objectHeight = bottom - top
+
+        // Background removal is only safe for a distinct item lying inside the scanner bed.
+        // A document filling almost all of the glass may contain pale security patterns.
+        return left > Double(width) * 0.035
+            && right < Double(width) * 0.965
+            && top > Double(height) * 0.035
+            && bottom < Double(height) * 0.965
+            && objectWidth > Double(width) * 0.5
+            && objectWidth < Double(width) * 0.93
+            && objectHeight > Double(height) * 0.5
+            && objectHeight < Double(height) * 0.93
+    }
+
     private static func fitLine(_ points: [(Double, Double)]) -> Line? {
         guard points.count > 10 else { return nil }
         var inliers = points
@@ -143,53 +168,6 @@ enum BackgroundWhitening {
         return Line(slope: slope, intercept: meanY - slope * meanX)
     }
 
-    private static func whitenConnectedNeutralBackground(in pixels: inout [UInt8], width: Int, height: Int) {
-        var background = [Bool](repeating: false, count: width * height)
-        var queue = [Int]()
-        queue.reserveCapacity(width * 2 + height * 2)
-
-        func isNeutral(_ index: Int) -> Bool {
-            let offset = index * 4
-            let red = Int(pixels[offset])
-            let green = Int(pixels[offset + 1])
-            let blue = Int(pixels[offset + 2])
-            return max(red, green, blue) - min(red, green, blue) <= 30
-        }
-
-        func enqueue(_ index: Int) {
-            guard !background[index], isNeutral(index) else { return }
-            background[index] = true
-            queue.append(index)
-        }
-
-        for x in 0..<width {
-            enqueue(x)
-            enqueue((height - 1) * width + x)
-        }
-        for y in 0..<height {
-            enqueue(y * width)
-            enqueue(y * width + width - 1)
-        }
-
-        var cursor = 0
-        while cursor < queue.count {
-            let index = queue[cursor]
-            cursor += 1
-            let x = index % width
-            let y = index / width
-            if x > 0 { enqueue(index - 1) }
-            if x + 1 < width { enqueue(index + 1) }
-            if y > 0 { enqueue(index - width) }
-            if y + 1 < height { enqueue(index + width) }
-        }
-
-        for index in queue {
-            let offset = index * 4
-            pixels[offset] = 255
-            pixels[offset + 1] = 255
-            pixels[offset + 2] = 255
-        }
-    }
 }
 
 private struct Line {
