@@ -1,0 +1,6 @@
+.DS_Store
+.build/
+dist/
+
+# The release bundle is attached to GitHub Releases, not committed as source.
+Installer/Сканировать SCX-4200.app/
