@@ -25,26 +25,15 @@ enum OutputFormat: String, CaseIterable, Identifiable, Sendable {
     var fileExtension: String { rawValue.lowercased() }
 }
 
-struct ScanReview: Identifiable, Sendable {
-    let id = UUID()
-    let originalURL: URL
-    let whiteBackgroundURL: URL?
-    let destinationURL: URL
-    let outputFormat: OutputFormat
-    let temporaryDirectory: URL
-}
-
 @MainActor
 final class ScannerViewModel: ObservableObject {
     @Published var mode: ScanMode = .color
     @Published var resolution = 300
     @Published var outputFormat: OutputFormat = .pdf
     @Published var reduceBanding = true
-    @Published var suggestWhiteBackground = true
     @Published var isScanning = false
     @Published var message = "Готов к сканированию"
     @Published var errorMessage: String?
-    @Published var review: ScanReview?
 
     func scan() {
         guard let scannerPath = Self.scannerPath() else {
@@ -67,7 +56,6 @@ final class ScannerViewModel: ObservableObject {
         let requestedResolution = resolution
         let requestedFormat = outputFormat
         let shouldReduceBanding = reduceBanding
-        let shouldSuggestWhiteBackground = suggestWhiteBackground
         isScanning = true
         message = "Сканирование..."
         errorMessage = nil
@@ -103,36 +91,12 @@ final class ScannerViewModel: ObservableObject {
                     try StripeReducer.reduceVerticalBanding(in: intermediate)
                 }
 
-                let original = temporaryDirectory.appendingPathComponent("original.png")
-                try FileManager.default.moveItem(at: intermediate, to: original)
-
-                if shouldSuggestWhiteBackground {
-                    let whiteBackground = temporaryDirectory.appendingPathComponent("white-background.png")
-                    try FileManager.default.copyItem(at: original, to: whiteBackground)
-                    let whiteBackgroundIsSafe = try BackgroundWhitening.whitenOuterBackground(in: whiteBackground)
-                    if !whiteBackgroundIsSafe {
-                        try? FileManager.default.removeItem(at: whiteBackground)
-                    }
-                    let scanReview = ScanReview(
-                        originalURL: original,
-                        whiteBackgroundURL: whiteBackgroundIsSafe ? whiteBackground : nil,
-                        destinationURL: destination,
-                        outputFormat: requestedFormat,
-                        temporaryDirectory: temporaryDirectory
-                    )
-                    await MainActor.run {
-                        self.isScanning = false
-                        self.message = "Выберите вариант для сохранения"
-                        self.review = scanReview
-                    }
-                } else {
-                    try Self.export(original, format: requestedFormat, destination: destination)
-                    try? FileManager.default.removeItem(at: temporaryDirectory)
-                    await MainActor.run {
-                        self.isScanning = false
-                        self.message = "Готово: \(destination.lastPathComponent)"
-                        NSWorkspace.shared.activateFileViewerSelecting([destination])
-                    }
+                try Self.export(intermediate, format: requestedFormat, destination: destination)
+                try? FileManager.default.removeItem(at: temporaryDirectory)
+                await MainActor.run {
+                    self.isScanning = false
+                    self.message = "Готово: \(destination.lastPathComponent)"
+                    NSWorkspace.shared.activateFileViewerSelecting([destination])
                 }
             } catch {
                 await MainActor.run {
@@ -142,38 +106,6 @@ final class ScannerViewModel: ObservableObject {
                 }
             }
         }
-    }
-
-    func saveReview(_ review: ScanReview, withWhiteBackground: Bool) {
-        self.review = nil
-        isScanning = true
-        message = "Сохранение..."
-
-        Task.detached {
-            do {
-                let source = withWhiteBackground ? (review.whiteBackgroundURL ?? review.originalURL) : review.originalURL
-                try Self.export(source, format: review.outputFormat, destination: review.destinationURL)
-                try? FileManager.default.removeItem(at: review.temporaryDirectory)
-                await MainActor.run {
-                    self.isScanning = false
-                    self.message = "Готово: \(review.destinationURL.lastPathComponent)"
-                    NSWorkspace.shared.activateFileViewerSelecting([review.destinationURL])
-                }
-            } catch {
-                try? FileManager.default.removeItem(at: review.temporaryDirectory)
-                await MainActor.run {
-                    self.isScanning = false
-                    self.message = "Не удалось сохранить скан"
-                    self.errorMessage = error.localizedDescription
-                }
-            }
-        }
-    }
-
-    func cancelReview(_ review: ScanReview) {
-        self.review = nil
-        try? FileManager.default.removeItem(at: review.temporaryDirectory)
-        message = "Скан не сохранён"
     }
 
     nonisolated private static func export(_ source: URL, format: OutputFormat, destination: URL) throws {
@@ -317,7 +249,6 @@ struct ContentView: View {
                     ForEach(OutputFormat.allCases) { Text($0.rawValue).tag($0) }
                 }
                 Toggle("Уменьшить вертикальные полосы", isOn: $model.reduceBanding)
-                Toggle("Предлагать белый фон после сканирования", isOn: $model.suggestWhiteBackground)
             }
             .formStyle(.grouped)
 
@@ -340,15 +271,6 @@ struct ContentView: View {
         }
         .padding(28)
         .frame(width: 390)
-        .sheet(item: $model.review) { review in
-            ScanReviewView(
-                review: review,
-                keepOriginal: { model.saveReview(review, withWhiteBackground: false) },
-                keepWhiteBackground: { model.saveReview(review, withWhiteBackground: true) },
-                cancel: { model.cancelReview(review) }
-            )
-            .interactiveDismissDisabled()
-        }
         .alert("Не удалось отсканировать", isPresented: Binding(
             get: { model.errorMessage != nil },
             set: { if !$0 { model.errorMessage = nil } }
@@ -356,76 +278,6 @@ struct ContentView: View {
             Button("Закрыть", role: .cancel) {}
         } message: {
             Text(model.errorMessage ?? "")
-        }
-    }
-}
-
-private struct ScanReviewView: View {
-    let review: ScanReview
-    let keepOriginal: () -> Void
-    let keepWhiteBackground: () -> Void
-    let cancel: () -> Void
-
-    var body: some View {
-        VStack(spacing: 20) {
-            VStack(spacing: 5) {
-                Text("Как сохранить скан?")
-                    .font(.title2.weight(.semibold))
-                Text("Слева исходный скан, справа вариант с вырезанным объектом на белом фоне.")
-                    .foregroundStyle(.secondary)
-            }
-
-            HStack(alignment: .top, spacing: 18) {
-                preview(title: "Как есть", url: review.originalURL)
-                if let whiteBackgroundURL = review.whiteBackgroundURL {
-                    preview(title: "Белый фон", url: whiteBackgroundURL)
-                } else {
-                    unavailableWhiteBackgroundPreview
-                }
-            }
-
-            HStack {
-                Button("Отменить", role: .cancel, action: cancel)
-                Spacer()
-                Button("Оставить как есть", action: keepOriginal)
-                if review.whiteBackgroundURL != nil {
-                    Button("Сохранить с белым фоном", action: keepWhiteBackground)
-                        .keyboardShortcut(.defaultAction)
-                }
-            }
-        }
-        .padding(24)
-        .frame(minWidth: 860, minHeight: 650)
-    }
-
-    @ViewBuilder
-    private func preview(title: String, url: URL) -> some View {
-        VStack(alignment: .leading, spacing: 8) {
-            Text(title).font(.headline)
-            Group {
-                if let image = NSImage(contentsOf: url) {
-                    Image(nsImage: image)
-                        .resizable()
-                        .scaledToFit()
-                } else {
-                    ContentUnavailableView("Не удалось открыть превью", systemImage: "exclamationmark.triangle")
-                }
-            }
-            .frame(width: 390, height: 500)
-            .background(.quaternary, in: RoundedRectangle(cornerRadius: 10))
-        }
-    }
-
-    private var unavailableWhiteBackgroundPreview: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            Text("Белый фон").font(.headline)
-            ContentUnavailableView(
-                "Недоступно безопасно",
-                systemImage: "checkmark.shield",
-                description: Text("Документ заполняет почти всё стекло или содержит бледный цветной рисунок. Оригинальные цвета сохранены.")
-            )
-            .frame(width: 390, height: 500)
-            .background(.quaternary, in: RoundedRectangle(cornerRadius: 10))
         }
     }
 }
